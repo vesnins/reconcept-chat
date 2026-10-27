@@ -164,6 +164,12 @@ def schedule(sid):
     if not AI_KEY or not r or not r[0]:
         return
     h = datetime.now(TZ).hour
+    if sid not in lead:  # после перезапуска: ведёт ИИ, если из ответов последний — его
+        try:
+            if next((m['d'] for m in reversed(site(f'history?sid={sid}')) if m['d']), 0) == 2:
+                lead.add(sid)
+        except Exception as e:
+            log.warning('lead: %s', e)
     cancel(sid)
     t = timers[sid] = threading.Timer(1 if sid in lead else 3 if h >= 22 or h < 6 else 60, ai_reply, (sid,))
     t.daemon = True
@@ -183,6 +189,7 @@ def ai_reply(sid):
         hist = site(f'history?sid={sid}')
         if not hist or hist[-1]['d'] != 0 or sum(m['d'] == 2 for m in hist) >= 30:
             return
+        lead.add(sid)  # ИИ взялся отвечать: новые сообщения посетителя — без минутной паузы
         th = sql('SELECT thread FROM topic WHERE sid=?', sid)
         if not any(m['d'] == 2 for m in hist):  # ИИ впервые в диалоге — представляется
             site('push', {'sid': sid, 'text': HELLO, 'd': 2})
@@ -208,7 +215,6 @@ def ai_reply(sid):
             return
         site('push', {'sid': sid, 'text': text, 'd': 2})
         sent = True
-        lead.add(sid)
         if th:
             tg('sendMessage', chat_id=CHAT, message_thread_id=th[0], text=f'🤖 {text}')
     except Exception as e:

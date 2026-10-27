@@ -18,6 +18,7 @@ PROMPT = ('Ты — ИИ-помощник Сергея Веснина (веб-с
           'Не обещай точные сроки, скидки и результаты, не придумывай кейсы и факты. Чего нет в фактах — скажи, что Сергей уточнит и ответит здесь. '
           'Помоги понять задачу: задай один уточняющий вопрос. Не проси телефон, почту, ФИО. Не выдавай себя за Сергея: '
           'если спросят, человек ли ты, честно скажи, что ты ИИ-помощник, а Сергей ответит сам. На темы, не связанные с услугами студии, не отвечай.\n\n')
+HELLO = 'Сергей не может ответить прямо сейчас. Я его помощник — постараюсь помочь, а Сергей подключится позже.'
 timers = {}
 MEDIA = ('photo', 'document', 'sticker', 'voice', 'video', 'video_note', 'audio', 'animation')
 
@@ -25,10 +26,11 @@ db = sqlite3.connect(os.path.join(os.environ.get('STATE_DIRECTORY', os.path.dirn
                      check_same_thread=False, isolation_level=None)
 db.executescript('CREATE TABLE IF NOT EXISTS topic(sid TEXT PRIMARY KEY, thread INTEGER UNIQUE, page TEXT);'
                  'CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);')
-try:
-    db.execute('ALTER TABLE topic ADD COLUMN ai INTEGER DEFAULT 1')
-except sqlite3.OperationalError:
-    pass
+for c in ('ai INTEGER DEFAULT 1', 'btn INTEGER'):
+    try:
+        db.execute('ALTER TABLE topic ADD COLUMN ' + c)
+    except sqlite3.OperationalError:
+        pass
 lock = threading.Lock()
 
 
@@ -89,6 +91,28 @@ def topic(sid, meta):
     return t, page
 
 
+def kb(on):
+    return {'inline_keyboard': [[{'text': ('✅ ' if on else '') + 'ИИ вкл', 'callback_data': 'ai:1'},
+                                 {'text': ('' if on else '✅ ') + 'ИИ выкл', 'callback_data': 'ai:0'}]]}
+
+
+def button(sid, th, mid):
+    """Кнопки ИИ — только под последним сообщением посетителя."""
+    ai, old = sql('SELECT ai, btn FROM topic WHERE sid=?', sid)
+    if old:
+        try:
+            tg('editMessageReplyMarkup', chat_id=CHAT, message_id=old, reply_markup={'inline_keyboard': []})
+        except TgError:
+            pass
+    tg('editMessageReplyMarkup', chat_id=CHAT, message_id=mid, reply_markup=kb(ai))
+    sql('UPDATE topic SET btn=? WHERE sid=?', mid, sid)
+
+
+def set_ai(sid, on):
+    sql('UPDATE topic SET ai=? WHERE sid=?', int(on), sid)
+    schedule(sid) if on else cancel(sid)
+
+
 def to_tg(m, retry=True):
     meta = json.loads(m.get('meta') or '{}')
     t, last = topic(m['sid'], meta)
@@ -96,7 +120,7 @@ def to_tg(m, retry=True):
     if page and page != last:
         text = f'[{page}]\n{text}'
     try:
-        tg('sendMessage', chat_id=CHAT, message_thread_id=t, text=text)
+        mid = tg('sendMessage', chat_id=CHAT, message_thread_id=t, text=text)['message_id']
     except TgError as e:
         if retry and 'thread' in str(e).lower():  # тему удалили — заводим заново
             sql('DELETE FROM topic WHERE sid=?', m['sid'])
@@ -104,6 +128,10 @@ def to_tg(m, retry=True):
         raise
     if page and page != last:
         sql('UPDATE topic SET page=? WHERE sid=?', page, m['sid'])
+    try:
+        button(m['sid'], t, mid)
+    except TgError as e:
+        log.warning('btn: %s', e)
 
 
 def schedule(sid):
@@ -145,10 +173,15 @@ def ai_reply(sid):
         text = ''.join(b.get('text', '') for b in r.get('content', [])).strip()
         if not text or sid in timers or site(f'history?sid={sid}')[-1]['d'] != 0:  # пока думал, ответил Сергей или пришло новое
             return
+        if not any(m['d'] == 2 for m in hist):  # первое включение ИИ в диалоге
+            site('push', {'sid': sid, 'text': HELLO, 'd': 2})
+            hello = HELLO + '\n'
+        else:
+            hello = ''
         site('push', {'sid': sid, 'text': text, 'd': 2})
         th = sql('SELECT thread FROM topic WHERE sid=?', sid)
         if th:
-            tg('sendMessage', chat_id=CHAT, message_thread_id=th[0], text=f'🤖 {text}')
+            tg('sendMessage', chat_id=CHAT, message_thread_id=th[0], text=f'🤖 {hello}{text}')
     except Exception as e:
         log.warning('ai: %s', e)
 
@@ -168,16 +201,28 @@ def site_loop():
 def tg_loop():
     while True:
         try:
-            for u in tg('getUpdates', _t=70, offset=kv('off'), timeout=50, allowed_updates=['message']):
+            for u in tg('getUpdates', _t=70, offset=kv('off'), timeout=50, allowed_updates=['message', 'callback_query']):
+                q = u.get('callback_query')
+                if q:
+                    qm = q.get('message') or {}
+                    r = qm.get('chat', {}).get('id') == CHAT and sql('SELECT sid FROM topic WHERE thread=?', qm.get('message_thread_id'))
+                    if r and q.get('data') in ('ai:0', 'ai:1'):
+                        on = q['data'] == 'ai:1'
+                        set_ai(r[0], on)
+                        tg('answerCallbackQuery', callback_query_id=q['id'], text='ИИ ' + ('включён' if on else 'выключен'))
+                        try:
+                            tg('editMessageReplyMarkup', chat_id=CHAT, message_id=qm['message_id'], reply_markup=kb(on))
+                        except TgError:
+                            pass  # «message is not modified»
+                    else:
+                        tg('answerCallbackQuery', callback_query_id=q['id'])
                 msg = u.get('message') or {}
                 th = msg.get('message_thread_id')
                 if msg.get('chat', {}).get('id') == CHAT and th and not msg.get('from', {}).get('is_bot'):
                     r = sql('SELECT sid FROM topic WHERE thread=?', th)
                     cmd = (msg.get('text') or '').strip().lower()
                     if r and cmd in ('/ai off', '/ai on'):
-                        sql('UPDATE topic SET ai=? WHERE sid=?', int(cmd == '/ai on'), r[0])
-                        if cmd == '/ai off':
-                            cancel(r[0])
+                        set_ai(r[0], cmd == '/ai on')
                         tg('sendMessage', chat_id=CHAT, message_thread_id=th, text='ИИ в этом диалоге ' + ('включён' if cmd == '/ai on' else 'выключен'))
                     elif r and msg.get('text'):
                         cancel(r[0])

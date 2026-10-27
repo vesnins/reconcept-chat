@@ -1,0 +1,3 @@
+.env
+state.db*
+__pycache__/

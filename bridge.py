@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Мост reconcept.ru <-> Telegram. Посетитель = тема в группе; ответ в теме уходит на сайт. Только stdlib."""
-import json, logging, os, sqlite3, threading, time, urllib.error, urllib.request
+import json, logging, re, os, sqlite3, threading, time, urllib.error, urllib.request
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -12,14 +12,21 @@ TG = os.environ.get('TG_API', 'https://api.telegram.org').rstrip('/') + f'/bot{T
 AI_KEY, AI_MODEL = os.environ.get('ANTHROPIC_API_KEY', ''), os.environ.get('AI_MODEL', 'claude-haiku-5-5')
 KNOW = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'knowledge.md')
 TZ = ZoneInfo('Europe/Belgrade')
-PROMPT = ('Ты — ИИ-помощник Сергея Веснина (веб-студия Reconcept) в чате на сайте reconcept.ru. Сергей сейчас не на связи, '
-          'ты отвечаешь, пока он не подключится; он видит переписку и продолжит сам. Пиши по-русски, коротко (1–4 предложения), '
-          'дружелюбно и просто, без markdown, списков и приветствий в каждом сообщении. Опирайся только на факты ниже; цены называй со словом «от». '
-          'Не обещай точные сроки, скидки и результаты, не придумывай кейсы и факты. Чего нет в фактах — скажи, что Сергей уточнит и ответит здесь. '
-          'Помоги понять задачу: задай один уточняющий вопрос. Не проси телефон, почту, ФИО. Не выдавай себя за Сергея: '
-          'если спросят, человек ли ты, честно скажи, что ты ИИ-помощник, а Сергей ответит сам. На темы, не связанные с услугами студии, не отвечай.\n\n')
+PROMPT = ('Ты — Робот-секретарь Сергея Веснина (веб-студия Reconcept) в чате на сайте reconcept.ru. Сергей сейчас не на связи; '
+          'посетителю уже сказали, что ты его помощник, — не повторяй это и не упоминай Сергея без нужды. '
+          'Цель: коротко ответить на вопрос и получить контакт, чтобы Сергей связался с посетителем. '
+          'Пиши по-русски, 1–3 предложения, дружелюбно и просто, без markdown, списков и приветствий. '
+          'Опирайся только на факты ниже; цены называй со словом «от». Не обещай точные сроки, скидки и результаты, не придумывай факты. '
+          'Чего нет в фактах — скажи, что это обсудит Сергей. '
+          'Ничего не требуй от посетителя: никаких текстов, фото, ТЗ, подробностей. Уточняющий вопрос — только если без него нельзя ответить. '
+          'Ответив, предложи оставить удобный контакт — Telegram, MAX, телефон или почту, — чтобы Сергей связался. '
+          'Если контакт уже оставлен — поблагодари и скажи, что Сергей свяжется; больше контакт не проси. '
+          'Если посетитель не хочет оставлять контакт — не настаивай: Сергей ответит здесь, в чате. '
+          'Не выдавай себя за Сергея: если спросят, человек ли ты, скажи, что ты робот-секретарь. '
+          'На темы, не связанные с услугами студии, не отвечай.\n\n')
 HELLO = 'Сергей не может ответить прямо сейчас. Я его помощник — постараюсь помочь, а Сергей подключится позже.'
-timers = {}
+timers, lead = {}, set()  # lead — диалоги, которые сейчас ведёт ИИ
+CONTACT = re.compile(r'(?:\+?[78][\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2})|[\w.+-]+@[\w-]+\.[\w.-]+|(?<![\w@])@[A-Za-z]\w{3,31}|t\.me/\S+|max\.ru/\S+', re.I)
 MEDIA = ('photo', 'document', 'sticker', 'voice', 'video', 'video_note', 'audio', 'animation')
 
 db = sqlite3.connect(os.path.join(os.environ.get('STATE_DIRECTORY', os.path.dirname(os.path.abspath(__file__))), 'state.db'),
@@ -108,8 +115,18 @@ def button(sid, th, mid):
     sql('UPDATE topic SET btn=? WHERE sid=?', mid, sid)
 
 
+def typing(sid, d, ms):
+    """Индикатор «…пишет» на сайте: d=1 Сергей, d=2 ИИ; ms=0 — убрать."""
+    try:
+        site('typing', {'sid': sid, 'd': d, 'ms': ms})
+    except Exception as e:
+        log.warning('typing: %s', e)
+
+
 def set_ai(sid, on):
     sql('UPDATE topic SET ai=? WHERE sid=?', int(on), sid)
+    lead.discard(sid)
+    typing(sid, 1, 0 if on else 180000)  # «ИИ выкл» = Сергей отвечает
     schedule(sid) if on else cancel(sid)
 
 
@@ -128,6 +145,13 @@ def to_tg(m, retry=True):
         raise
     if page and page != last:
         sql('UPDATE topic SET page=? WHERE sid=?', page, m['sid'])
+    found = CONTACT.findall(m['t'])
+    if found:
+        try:
+            c = tg('sendMessage', chat_id=CHAT, message_thread_id=t, text='📇 Контакт: ' + ', '.join(dict.fromkeys(found)))
+            tg('pinChatMessage', chat_id=CHAT, message_id=c['message_id'], disable_notification=True)
+        except TgError as e:
+            log.warning('pin: %s', e)
     try:
         button(m['sid'], t, mid)
     except TgError as e:
@@ -135,13 +159,13 @@ def to_tg(m, retry=True):
 
 
 def schedule(sid):
-    """ИИ отвечает, если Сергей молчит минуту; с 22:00 до 6:00 (Белград) — сразу."""
+    """ИИ отвечает, если Сергей молчит минуту; с 22:00 до 6:00 (Белград) и в диалоге, который ИИ уже ведёт, — сразу."""
     r = sql('SELECT ai FROM topic WHERE sid=?', sid)
     if not AI_KEY or not r or not r[0]:
         return
     h = datetime.now(TZ).hour
     cancel(sid)
-    t = timers[sid] = threading.Timer(3 if h >= 22 or h < 6 else 60, ai_reply, (sid,))
+    t = timers[sid] = threading.Timer(1 if sid in lead else 3 if h >= 22 or h < 6 else 60, ai_reply, (sid,))
     t.daemon = True
     t.start()
 
@@ -154,10 +178,18 @@ def cancel(sid):
 
 def ai_reply(sid):
     timers.pop(sid, None)
+    sent = False
     try:
         hist = site(f'history?sid={sid}')
         if not hist or hist[-1]['d'] != 0 or sum(m['d'] == 2 for m in hist) >= 30:
             return
+        th = sql('SELECT thread FROM topic WHERE sid=?', sid)
+        if not any(m['d'] == 2 for m in hist):  # ИИ впервые в диалоге — представляется
+            site('push', {'sid': sid, 'text': HELLO, 'd': 2})
+            if th:
+                tg('sendMessage', chat_id=CHAT, message_thread_id=th[0], text=f'🤖 {HELLO}')
+        typing(sid, 2, 60000)
+        t0 = time.monotonic()
         msgs = []
         for m in hist[-40:]:
             role = 'user' if m['d'] == 0 else 'assistant'
@@ -171,19 +203,19 @@ def ai_reply(sid):
                  {'model': AI_MODEL, 'max_tokens': 500, 'system': system, 'messages': msgs},
                  {'x-api-key': AI_KEY, 'anthropic-version': '2023-06-01'}, timeout=60)
         text = ''.join(b.get('text', '') for b in r.get('content', [])).strip()
+        time.sleep(max(0, min(1.5 + len(text) / 60, 6) - (time.monotonic() - t0)))  # «печатает» не мгновенно
         if not text or sid in timers or site(f'history?sid={sid}')[-1]['d'] != 0:  # пока думал, ответил Сергей или пришло новое
             return
-        if not any(m['d'] == 2 for m in hist):  # первое включение ИИ в диалоге
-            site('push', {'sid': sid, 'text': HELLO, 'd': 2})
-            hello = HELLO + '\n'
-        else:
-            hello = ''
         site('push', {'sid': sid, 'text': text, 'd': 2})
-        th = sql('SELECT thread FROM topic WHERE sid=?', sid)
+        sent = True
+        lead.add(sid)
         if th:
-            tg('sendMessage', chat_id=CHAT, message_thread_id=th[0], text=f'🤖 {hello}{text}')
+            tg('sendMessage', chat_id=CHAT, message_thread_id=th[0], text=f'🤖 {text}')
     except Exception as e:
         log.warning('ai: %s', e)
+    finally:
+        if not sent and sid not in timers:
+            typing(sid, 2, 0)
 
 
 def site_loop():
@@ -226,6 +258,7 @@ def tg_loop():
                         tg('sendMessage', chat_id=CHAT, message_thread_id=th, text='ИИ в этом диалоге ' + ('включён' if cmd == '/ai on' else 'выключен'))
                     elif r and msg.get('text'):
                         cancel(r[0])
+                        lead.discard(r[0])
                         try:
                             site('push', {'sid': r[0], 'text': msg['text']})
                         except urllib.error.HTTPError as e:

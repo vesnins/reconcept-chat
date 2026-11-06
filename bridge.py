@@ -33,7 +33,7 @@ db = sqlite3.connect(os.path.join(os.environ.get('STATE_DIRECTORY', os.path.dirn
                      check_same_thread=False, isolation_level=None)
 db.executescript('CREATE TABLE IF NOT EXISTS topic(sid TEXT PRIMARY KEY, thread INTEGER UNIQUE, page TEXT);'
                  'CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);')
-for c in ('ai INTEGER DEFAULT 1', 'btn INTEGER', 'chip INTEGER DEFAULT 0'):
+for c in ('ai INTEGER DEFAULT 1', 'btn INTEGER', 'chip INTEGER DEFAULT 0', 'kp INTEGER'):
     try:
         db.execute('ALTER TABLE topic ADD COLUMN ' + c)
     except sqlite3.OperationalError:
@@ -85,16 +85,25 @@ def site(path, data=None):
     return call(f'{SITE}/api/chat/bridge/{path}', data, {'Authorization': f'Bearer {KEY}'})
 
 
+tlock = threading.Lock()  # одна тема на диалог, даже если сообщение и сигнал КП пришли одновременно
+
+
 def topic(sid, meta):
+    with tlock:
+        return _topic(sid, meta)
+
+
+def _topic(sid, meta):
     r = sql('SELECT thread, page FROM topic WHERE sid=?', sid)
     if r:
         return r
-    page = meta.get('page') or '/'
-    t = tg('createForumTopic', chat_id=CHAT, name=f'{page} · {sid[:4]}'[:120])['message_thread_id']
-    info = [f'Страница: {SITE}{page}', meta.get('ref') and f"Откуда: {meta['ref']}", meta.get('ua') and f"Браузер: {meta['ua']}"]
+    page, kp = meta.get('page') or '/', meta.get('kp')  # kp — чат на странице КП: тема «КП №», ИИ выключен
+    t = tg('createForumTopic', chat_id=CHAT, name=f'КП №{kp}' if kp else f'{page} · {sid[:4]}'[:120])['message_thread_id']
+    info = [f'Чат КП №{kp}: {SITE}/kp/admin#{kp}\nСообщения отсюда появятся у клиента на странице КП.' if kp else f'Страница: {SITE}{page}',
+            meta.get('ref') and f"Откуда: {meta['ref']}", meta.get('ua') and f"Браузер: {meta['ua']}"]
     tg('sendMessage', chat_id=CHAT, message_thread_id=t, text='\n'.join(x for x in info if x),
        link_preview_options={'is_disabled': True})
-    sql('INSERT OR REPLACE INTO topic(sid, thread, page) VALUES(?,?,?)', sid, t, page)
+    sql('INSERT OR REPLACE INTO topic(sid, thread, page, ai, kp) VALUES(?,?,?,?,?)', sid, t, page, 0 if kp else 1, kp)
     return t, page
 
 
@@ -244,7 +253,15 @@ def tg_loop():
                 if q:
                     qm = q.get('message') or {}
                     r = qm.get('chat', {}).get('id') == CHAT and sql('SELECT sid FROM topic WHERE thread=?', qm.get('message_thread_id'))
-                    if r and q.get('data') in ('ai:0', 'ai:1'):
+                    if (q.get('data') or '').startswith('kpok:') and qm.get('chat', {}).get('id') == CHAT:  # «✅ Написал» — без напоминания
+                        call(f'{SITE}/api/kp/bridge/ok', {'id': int(q['data'][5:])}, AUTH)
+                        tg('answerCallbackQuery', callback_query_id=q['id'], text='Отмечено')
+                        try:
+                            tg('editMessageReplyMarkup', chat_id=CHAT, message_id=qm['message_id'],
+                               reply_markup={'inline_keyboard': (qm.get('reply_markup') or {}).get('inline_keyboard', [])[:1]})
+                        except TgError:
+                            pass
+                    elif r and q.get('data') in ('ai:0', 'ai:1'):
                         on = q['data'] == 'ai:1'
                         set_ai(r[0], on)
                         tg('answerCallbackQuery', callback_query_id=q['id'], text='ИИ ' + ('включён' if on else 'выключен'))
@@ -311,9 +328,14 @@ def kp_signal(d, retry=True):
     if not t:
         t = tg('createForumTopic', chat_id=CHAT, name='КП')['message_thread_id']
         kv('kp_thread', t)
+    row = [{'text': 'Смотреть', 'url': d['url']}]
+    if d.get('chat'):  # «Написать» — тема чата КП: ответ в ней появится у клиента на странице КП
+        th = topic(d['chat']['sid'], {'kp': d['chat']['kp'], 'page': '/kp'})[0]
+        row.append({'text': 'Написать', 'url': f'https://t.me/c/{str(CHAT).removeprefix("-100")}/{th}'})
+    kb_ = [row] + ([[{'text': '✅ Написал', 'callback_data': f"kpok:{d['ok']}"}]] if d.get('ok') else [])
     try:
         tg('sendMessage', chat_id=CHAT, message_thread_id=t, text=d['text'], link_preview_options={'is_disabled': True},
-           reply_markup={'inline_keyboard': [[{'text': 'Смотреть', 'url': d['url']}]]})
+           reply_markup={'inline_keyboard': kb_})
     except TgError as e:
         if retry and 'thread' in str(e).lower():  # тему «КП» удалили — заводим заново
             kv('kp_thread', 0)

@@ -34,6 +34,8 @@ PROMPT = ('Ты — робот-секретарь веб-студии Reconcept 
 TIPS = {'kp': 'вернулся после КП', 'direct': 'пришёл из Директа', 'cases': 'смотрит кейсы', 'price': 'страница услуги',
         'back': 'повторный визит', 'exit': 'уходил со страницы', 'idle': '30 секунд на странице', 'form': 'завис на анкете КП'}
 ASK = 'Опишите, пожалуйста, вашу задачу.'  # ответ на быструю кнопку-подсказку
+CALC = 'Посчитаем точную цену прямо здесь. Что нужно: сайт или реклама в Яндекс Директе?'  # ответ на «Посчитать в чате» (chip 3)
+AUTO = 'Пожалуйста, опишите коротко свою задачу. По ней я пойму, чем мы можем вам помочь.'  # сайт отвечает сам от имени Сергея (d=3)
 timers, lead = {}, set()  # lead — диалоги, которые сейчас ведёт ИИ
 CONTACT = re.compile(r'(?:\+?[78][\s(-]*\d{3}[\s)-]*\d{3}[\s-]*\d{2}[\s-]*\d{2})|[\w.+-]+@[\w-]+\.[\w.-]+|(?<![\w@])@[A-Za-z]\w{3,31}|t\.me/\S+|max\.ru/\S+', re.I)
 MEDIA = ('photo', 'document', 'sticker', 'voice', 'video', 'video_note', 'audio', 'animation')
@@ -156,6 +158,8 @@ def to_tg(m, retry=True):
     text, page = m['t'], meta.get('page')
     if page and page != last:
         text = f'[{page}]\n{text}'
+    if meta.get('chip') == 3:
+        text += f'\n\n↳ Автоответ на сайте: {AUTO}'
     try:
         mid = tg('sendMessage', chat_id=CHAT, message_thread_id=t, text=text)['message_id']
     except TgError as e:
@@ -265,7 +269,7 @@ def ai_reply(sid):
     timers.pop(sid, None)
     sent = False
     try:
-        hist = site(f'history?sid={sid}')
+        hist = [m for m in site(f'history?sid={sid}') if m['d'] != 3]  # автоответ сайта — не реплика робота и не Сергея
         if not hist or hist[-1]['d'] != 0 or sum(m['d'] == 2 for m in hist) >= 30:
             return
         lead.add(sid)  # ИИ взялся отвечать: новые сообщения посетителя — без минутной паузы
@@ -279,8 +283,8 @@ def ai_reply(sid):
                 msgs[-1]['content'] += '\n' + m['t']
             elif msgs or role == 'user':
                 msgs.append({'role': role, 'content': m['t']})
-        if th and th[1]:  # посетитель нажал подсказку — просим описать задачу
-            text = ASK
+        if th and th[1]:  # посетитель нажал подсказку: 1 — просим описать задачу, 3 — начинаем расчёт КП
+            text = CALC if th[1] == 3 else ASK
         else:
             with open(KNOW, encoding='utf-8') as f:
                 system = PROMPT + (f'Посетитель сейчас на странице {th[2]}.\n\n' if th and th[2] else '') + f.read()
@@ -297,7 +301,7 @@ def ai_reply(sid):
                          {'role': 'user', 'content': [{'type': 'tool_result', 'tool_use_id': u['id'],
                                                        'content': json.dumps(ai_tool(sid, th and th[0], u['name'], u.get('input') or {}), ensure_ascii=False)} for u in uses]}]
         time.sleep(max(0, min(1.5 + len(text) / 60, 6) - (time.monotonic() - t0)))  # «печатает» не мгновенно
-        if not text or sid in timers or site(f'history?sid={sid}')[-1]['d'] != 0:  # пока думал, ответил Сергей или пришло новое
+        if not text or sid in timers or [m for m in site(f'history?sid={sid}') if m['d'] != 3][-1]['d'] != 0:  # пока думал, ответил Сергей или пришло новое
             return
         site('push', {'sid': sid, 'text': text, 'd': 2})
         sent = True
@@ -315,7 +319,8 @@ def site_loop():
         try:
             for m in site(f"pull?after={kv('after')}"):
                 to_tg(m)
-                sql('UPDATE topic SET chip=? WHERE sid=?', int(json.loads(m.get('meta') or '{}').get('chip') == 1), m['sid'])
+                c = json.loads(m.get('meta') or '{}').get('chip')
+                sql('UPDATE topic SET chip=? WHERE sid=?', c if c in (1, 3) else 0, m['sid'])
                 kv('after', m['id'])
                 schedule(m['sid'])
         except Exception as e:
